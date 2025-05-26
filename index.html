@@ -1,0 +1,1206 @@
+<!DOCTYPE html>
+<html lang="he" dir="rtl">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>מערכת שיבוץ שולחנות לאירוע</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <script src="https://unpkg.com/xlsx/dist/xlsx.full.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
+  <style>
+    /* Custom scrollbar for better aesthetics */
+    ::-webkit-scrollbar {
+      width: 8px;
+    }
+    ::-webkit-scrollbar-track {
+      background: #f1f1f1;
+      border-radius: 10px;
+    }
+    ::-webkit-scrollbar-thumb {
+      background: #888;
+      border-radius: 10px;
+    }
+    ::-webkit-scrollbar-thumb:hover {
+      background: #555;
+      cursor: grab;
+    }
+  </style>
+</head>
+<body class="min-h-screen bg-gradient-to-br from-blue-50 to-pink-50 p-6 font-sans">
+  <div id="root"></div>
+
+  <script type="text/babel">
+    const { useState, useRef, useMemo, useCallback } = React;
+
+    // Helper to generate unique IDs
+    const generateUniqueId = (prefix = '') => `${prefix}-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+
+    function TableSeatingSystem() {
+      const [guests, setGuests] = useState([]);
+      const [separateSeating, setSeparateSeating] = useState(true);
+      const [menTables, setMenTables] = useState([{ id: generateUniqueId('men'), name: 'גברים 1', guests: [], capacity: 12 }]);
+      const [womenTables, setWomenTables] = useState([{ id: generateUniqueId('women'), name: 'נשים 1', guests: [], capacity: 12 }]);
+      const [mixedTables, setMixedTables] = useState([{ id: generateUniqueId('mix'), name: 'שולחן 1', guests: [], capacity: 12 }]);
+      const [draggedGuest, setDraggedGuest] = useState(null);
+      const [dragOverTable, setDragOverTable] = useState(null);
+      const [showSettings, setShowSettings] = useState(false);
+      const [defaultCapacity, setDefaultCapacity] = useState(12);
+      const [selectedGuest, setSelectedGuest] = useState(null);
+      const [modalGender, setModalGender] = useState(null); // 'men', 'women', 'mixed'
+      const [showAddGuestModal, setShowAddGuestModal] = useState(false);
+      const [newGuestName, setNewGuestName] = useState('');
+      const [newGuestMen, setNewGuestMen] = useState(''); // Changed to string to allow partial input
+      const [newGuestWomen, setNewGuestWomen] = useState(''); // Changed to string to allow partial input
+
+      const fileInputRef = useRef(null);
+      const importRef = useRef(null);
+      const layoutRef = useRef(null); // Ref for the main layout div for PDF export
+
+      // Reset tables based on mode
+      const resetTables = useCallback((sep) => {
+        const resetTableArray = (type, count) => Array.from({ length: count }, (_, i) => ({
+          id: generateUniqueId(type),
+          name: `${type === 'men' ? 'גברים' : type === 'women' ? 'נשים' : 'שולחן'} ${i + 1}`,
+          guests: [], // Stores { guestId: string, menCount: number, womenCount: number }
+          capacity: defaultCapacity
+        }));
+
+        if (sep) {
+          setMenTables(resetTableArray('men', 1));
+          setWomenTables(resetTableArray('women', 1));
+          setMixedTables([]);
+        } else {
+          setMixedTables(resetTableArray('mix', 1));
+          setMenTables([]);
+          setWomenTables([]);
+        }
+      }, [defaultCapacity]);
+
+      // 1) ייבוא מוזמנים – קרא כ-array of arrays
+      const handleFileUpload = async e => {
+        const file = e.target.files[0];
+        if (!file) return;
+        try {
+          const buf = await file.arrayBuffer();
+          const wb = XLSX.read(buf);
+          const ws = wb.Sheets[wb.SheetNames[0]];
+          const aoa = XLSX.utils.sheet_to_json(ws, { header: 1 });
+          const dataRows = aoa.slice(1);
+          const newGuests = dataRows.map((row, i) => ({
+            id: generateUniqueId('guest'),
+            name: row[0] || `מוזמן ${i + 1}`,
+            men: parseInt(row[1], 10) || 0,
+            women: parseInt(row[2], 10) || 0,
+            // Track how many from this guest group are assigned
+            assignedMen: 0,
+            assignedWomen: 0,
+            assignedMixed: 0,
+          })).filter(g => g.men > 0 || g.women > 0);
+          setGuests(newGuests);
+          resetTables(separateSeating);
+        } catch(error) {
+          console.error("File upload error:", error);
+          alert('שגיאה בקריאת הקובץ. ודא שיש שורת כותרת, ועמודות: שם, גברים, נשים.');
+        }
+      };
+
+      // Toggle seating mode
+      const toggleSeatingMode = () => {
+        setSeparateSeating(prev => {
+          const next = !prev;
+          resetTables(next);
+          // When changing seating mode, reset assigned counts for all guests
+          setGuests(prevGuests => prevGuests.map(g => ({
+            ...g,
+            assignedMen: 0,
+            assignedWomen: 0,
+            assignedMixed: 0,
+          })));
+          return next;
+        });
+      };
+
+      // Helper to calculate current occupancy of a table
+      const calculateTableOccupancy = useCallback((table, type) => {
+        return table.guests.reduce((sum, guestEntry) => {
+          const guest = guests.find(g => g.id === guestEntry.guestId);
+          if (!guest) return sum;
+          if (type === 'men') return sum + guestEntry.menCount;
+          if (type === 'women') return sum + guestEntry.womenCount;
+          return sum + (guestEntry.menCount + guestEntry.womenCount); // Mixed
+        }, 0);
+      }, [guests]);
+
+      // Function to assign a guest (or part of a guest group) to a table
+      const assignGuestToTable = useCallback((guestToAssign, tableId, genderType, menCount = 0, womenCount = 0) => {
+          let list, setList;
+          if (separateSeating) {
+              if (genderType === 'men') { list = menTables; setList = setMenTables; menCount = guestToAssign.men; womenCount = 0; }
+              else if (genderType === 'women') { list = womenTables; setList = setWomenTables; womenCount = guestToAssign.women; menCount = 0;}
+          } else { // Mixed seating
+              list = mixedTables; setList = setMixedTables;
+              menCount = guestToAssign.men;
+              womenCount = guestToAssign.women;
+          }
+
+          // Check if guest (or relevant part) is already in this specific table
+          const existingTable = list.find(t => t.id === tableId);
+          const isGuestAlreadyInThisTable = existingTable && existingTable.guests.some(g => g.guestId === guestToAssign.id);
+
+          if (isGuestAlreadyInThisTable) {
+            closeModals();
+            setDraggedGuest(null);
+            setDragOverTable(null);
+            return; // Already there, do nothing
+          }
+
+          // Remove guest (or relevant part) from any *other* tables of the same genderType
+          setList(prevTables => prevTables.map(t => {
+              if (t.id === tableId) { // This is the target table, it will be handled explicitly later
+                  return t;
+              }
+              // For other tables, filter out the guest if they were assigned there
+              return {
+                  ...t,
+                  guests: t.guests.filter(entry => entry.guestId !== guestToAssign.id)
+              };
+          }));
+
+          // Add to new table
+          setList(prevTables => prevTables.map(t =>
+              t.id === tableId
+                  ? {
+                      ...t,
+                      guests: [...t.guests, {
+                          guestId: guestToAssign.id,
+                          menCount: menCount,
+                          womenCount: womenCount
+                      }]
+                  }
+                  : t
+          ));
+
+          // Update assigned counts in guest state
+          setGuests(prevGuests => prevGuests.map(g => {
+              if (g.id === guestToAssign.id) {
+                  return {
+                      ...g,
+                      assignedMen: separateSeating && genderType === 'men' ? guestToAssign.men : g.assignedMen,
+                      assignedWomen: separateSeating && genderType === 'women' ? guestToAssign.women : g.assignedWomen,
+                      assignedMixed: !separateSeating ? (guestToAssign.men + guestToAssign.women) : g.assignedMixed,
+                  };
+              }
+              return g;
+          }));
+
+          closeModals();
+          setDraggedGuest(null);
+          setDragOverTable(null);
+      }, [separateSeating, menTables, womenTables, mixedTables, guests]);
+
+      // 2) Drag & Drop
+      const handleDragStart = (e, g) => {
+        setDraggedGuest(g);
+        e.dataTransfer.effectAllowed = 'move';
+        e.dataTransfer.setData('text/plain', g.id); // Set guest ID
+      };
+      const handleDragOver = (e, tid) => {
+        e.preventDefault();
+        setDragOverTable(tid);
+      };
+      const handleDragLeave = () => setDragOverTable(null);
+
+      const handleDrop = (e, tableId, genderType) => {
+        e.preventDefault();
+        if (!draggedGuest) return;
+
+        const table = (separateSeating
+          ? (genderType === 'men' ? menTables : womenTables)
+          : mixedTables).find(t => t.id === tableId);
+
+        if (!table) return;
+
+        const neededCapacity = separateSeating
+          ? (genderType === 'men' ? (draggedGuest.men - draggedGuest.assignedMen) : (draggedGuest.women - draggedGuest.assignedWomen))
+          : ((draggedGuest.men + draggedGuest.women) - draggedGuest.assignedMixed);
+
+        // If nothing more to assign for this gender type
+        if (neededCapacity <= 0) {
+            setDraggedGuest(null);
+            setDragOverTable(null);
+            return;
+        }
+
+        const currentOccupancy = calculateTableOccupancy(table, genderType);
+
+        if (currentOccupancy + neededCapacity > table.capacity) {
+          alert(`לא מספיק מקום בשולחן (${neededCapacity} דרושים, ${table.capacity - currentOccupancy} פנוי)`);
+          setDraggedGuest(null);
+          setDragOverTable(null);
+          return;
+        }
+
+        assignGuestToTable(draggedGuest, tableId, genderType);
+      };
+
+      // 3) Unassign guest from a table
+      const unassign = useCallback((guestId, tableId, genderType) => {
+          let list, setList;
+          if (separateSeating) {
+              if (genderType === 'men') { list = menTables; setList = setMenTables; }
+              else { list = womenTables; setList = setWomenTables; }
+          } else {
+              list = mixedTables; setList = setMixedTables;
+          }
+
+          // Remove the guest from the table
+          setList(prevTables => prevTables.map(t =>
+              t.id === tableId
+                  ? { ...t, guests: t.guests.filter(entry => entry.guestId !== guestId) }
+                  : t
+          ));
+
+          // Update assigned counts in guest state
+          setGuests(prevGuests => prevGuests.map(g => {
+              if (g.id === guestId) {
+                  return {
+                      ...g,
+                      assignedMen: separateSeating && genderType === 'men' ? 0 : g.assignedMen,
+                      assignedWomen: separateSeating && genderType === 'women' ? 0 : g.assignedWomen,
+                      assignedMixed: !separateSeating ? 0 : g.assignedMixed,
+                  };
+              }
+              return g;
+          }));
+      }, [separateSeating, menTables, womenTables, mixedTables]);
+
+
+      // 4) Get unassigned guests list
+      const getUnassignedGuestsList = useMemo(() => {
+        const unassigned = [];
+        guests.forEach(g => {
+          const menNotFullyAssigned = (g.men > 0 && g.assignedMen < g.men);
+          const womenNotFullyAssigned = (g.women > 0 && g.assignedWomen < g.women);
+          const mixedNotFullyAssigned = (g.men + g.women > 0 && g.assignedMixed < (g.men + g.women));
+
+          if (separateSeating) {
+            if (menNotFullyAssigned || womenNotFullyAssigned) {
+              unassigned.push(g);
+            }
+          } else {
+            if (mixedNotFullyAssigned) {
+              unassigned.push(g);
+            }
+          }
+        });
+        return unassigned;
+      }, [guests, separateSeating]);
+
+
+      // 5) Add/Remove/Update tables (existing logic, with guest entry change)
+      const addTable = gender => {
+        const cap = defaultCapacity;
+        if (separateSeating) {
+          if (gender === 'men') {
+            setMenTables(ms => [...ms, { id: generateUniqueId('men'), name: `גברים ${ms.length + 1}`, guests: [], capacity: cap }]);
+          } else {
+            setWomenTables(ws => [...ws, { id: generateUniqueId('women'), name: `נשים ${ws.length + 1}`, guests: [], capacity: cap }]);
+          }
+        } else {
+          setMixedTables(ms => [...ms, { id: generateUniqueId('mix'), name: `שולחן ${ms.length + 1}`, guests: [], capacity: cap }]);
+        }
+      };
+      const removeTable = (id, gender) => {
+        let list, setList;
+        if (separateSeating) {
+          if (gender === 'men') { list = menTables; setList = setMenTables; }
+          else /* women */ { list = womenTables; setList = setWomenTables; }
+        } else {
+          list = mixedTables; setList = setMixedTables;
+        }
+        const tbl = list.find(t => t.id === id);
+        if (tbl.guests.length > 0) { alert('לא ניתן למחוק שולחן עם מוזמנים. אנא שחרר אותם קודם.'); return; }
+        if (list.length === 1) { alert('חייב להיות לפחות שולחן אחד'); return; }
+        setList(list.filter(t => t.id !== id));
+      };
+      const updateCapacity = (id, newCap, gender) => {
+        if (newCap < 1) return; // Prevent capacity less than 1
+        let list, setList;
+        if (separateSeating) {
+          if (gender === 'men') { list = menTables; setList = setMenTables; }
+          else { list = womenTables; setList = setWomenTables; }
+        } else {
+          list = mixedTables; setList = setMixedTables;
+        }
+
+        const tbl = list.find(t => t.id === id);
+        if (!tbl) return;
+
+        const currentOccupancy = calculateTableOccupancy(tbl, gender);
+
+        if (newCap < currentOccupancy) {
+          alert(`הקיבולת החדשה קטנה ממספר המוזמנים הקיימים בשולחן (${currentOccupancy} מוזמנים). אנא שחרר מוזמנים קודם.`);
+          return;
+        }
+
+        setList(list.map(t => t.id === id ? { ...t, capacity: newCap } : t));
+      };
+
+      // 6) Modals for click-to-assign
+      const openModal = (guest, gender) => {
+        setSelectedGuest(guest);
+        setModalGender(gender);
+      };
+      const closeModals = () => {
+        setSelectedGuest(null);
+        setModalGender(null);
+      };
+
+      const getAvailableTablesForModal = useCallback((genderType) => {
+          let tbls = separateSeating
+              ? (genderType === 'men' ? menTables : womenTables)
+              : mixedTables;
+
+          return tbls.filter(t => {
+              const currentOccupancy = calculateTableOccupancy(t, genderType);
+              let neededCapacity = 0;
+              if (selectedGuest) {
+                  if (separateSeating) {
+                      neededCapacity = genderType === 'men' ? (selectedGuest.men - selectedGuest.assignedMen) : (selectedGuest.women - selectedGuest.assignedWomen);
+                  } else {
+                      neededCapacity = (selectedGuest.men + selectedGuest.women) - selectedGuest.assignedMixed;
+                  }
+              }
+              return currentOccupancy + neededCapacity <= t.capacity;
+          });
+      }, [separateSeating, menTables, womenTables, mixedTables, selectedGuest, calculateTableOccupancy]);
+
+
+      // 7) Export to Excel
+      const exportToExcel = () => {
+        const data = [];
+        const allTables = [
+          ...menTables.map(t => ({ ...t, tableGender: 'גברים' })),
+          ...womenTables.map(t => ({ ...t, tableGender: 'נשים' })),
+          ...mixedTables.map(t => ({ ...t, tableGender: 'מעורב' }))
+        ];
+
+        allTables.forEach(t => {
+          t.guests.forEach(guestEntry => {
+            const g = guests.find(x => x.id === guestEntry.guestId);
+            if (g) {
+              data.push({
+                'שולחן ID': t.id, // For re-import
+                שולחן: t.name,
+                'מוזמן ID': g.id, // For re-import
+                מוזמן: g.name,
+                מגדר_שולחן: t.tableGender,
+                'גברים משובצים לשולחן זה': guestEntry.menCount, // Actual assigned count for this table
+                'נשים משובצות לשולחן זה': guestEntry.womenCount, // Actual assigned count for this table
+                'גברים מקורי': g.men,
+                'נשים מקורי': g.women
+              });
+            }
+          });
+        });
+
+        // Add unassigned guests (those not fully assigned for relevant gender)
+        guests.forEach(g => {
+            if (separateSeating) {
+                if (g.men > 0 && g.assignedMen < g.men) { // Men not fully assigned
+                    data.push({
+                        'שולחן ID': '', שולחן: '',
+                        'מוזמן ID': g.id, מוזמן: g.name,
+                        מגדר_שולחן: 'גברים',
+                        'גברים משובצים לשולחן זה': 0,
+                        'נשים משובצות לשולחן זה': 0,
+                        'גברים מקורי': g.men,
+                        'נשים מקורי': g.women
+                    });
+                }
+                if (g.women > 0 && g.assignedWomen < g.women) { // Women not fully assigned
+                    data.push({
+                        'שולחן ID': '', שולחן: '',
+                        'מוזמן ID': g.id, מוזמן: g.name,
+                        מגדר_שולחן: 'נשים',
+                        'גברים משובצים לשולחן זה': 0,
+                        'נשים משובצות לשולחן זה': 0,
+                        'גברים מקורי': g.men,
+                        'נשים מקורי': g.women
+                    });
+                }
+            } else { // Mixed seating
+                if (g.men + g.women > 0 && g.assignedMixed < (g.men + g.women)) { // Not fully assigned
+                    data.push({
+                        'שולחן ID': '', שולחן: '',
+                        'מוזמן ID': g.id, מוזמן: g.name,
+                        מגדר_שולחן: 'מעורב',
+                        'גברים משובצים לשולחן זה': 0,
+                        'נשים משובצות לשולחן זה': 0,
+                        'גברים מקורי': g.men,
+                        'נשים מקורי': g.women
+                    });
+                }
+            }
+        });
+
+        const ws = XLSX.utils.json_to_sheet(data);
+        const wb = XLSX.utils.book_new();
+        XLSX.utils.book_append_sheet(wb, ws, 'שיבוץ');
+        XLSX.writeFile(wb, 'shibutz.xlsx');
+      };
+
+      // 8) Import assignments and guests from exported file
+      const handleImport = async e => {
+        const file = e.target.files[0];
+        if (!file) return;
+        try {
+          const buf = await file.arrayBuffer();
+          const wb = XLSX.read(buf);
+          const ws = wb.Sheets[wb.SheetNames[0]];
+          const rows = XLSX.utils.sheet_to_json(ws);
+
+          const newGuestsMap = new Map();
+          const importedMenTablesMap = new Map();
+          const importedWomenTablesMap = new Map();
+          const importedMixedTablesMap = new Map();
+
+          let detectedSeparateSeating = true;
+
+          rows.forEach(r => {
+            const guestId = r['מוזמן ID'] || generateUniqueId('guest'); // Use existing ID or generate new
+            const guestName = r['מוזמן'];
+            const originalMen = parseInt(r['גברים מקורי'] || 0, 10);
+            const originalWomen = parseInt(r['נשים מקורי'] || 0, 10);
+            const assignedMenToTable = parseInt(r['גברים משובצים לשולחן זה'] || 0, 10);
+            const assignedWomenToTable = parseInt(r['נשים משובצות לשולחן זה'] || 0, 10);
+
+            const tableName = r['שולחן'];
+            const tableId = r['שולחן ID'] || (tableName ? generateUniqueId(r['מגדר_שולחן'] === 'גברים' ? 'men' : r['מגדר_שולחן'] === 'נשים' ? 'women' : 'mix') : '');
+            const tableGender = r['מגדר_שולחן'];
+
+            if (!newGuestsMap.has(guestId)) {
+                newGuestsMap.set(guestId, {
+                    id: guestId,
+                    name: guestName,
+                    men: originalMen,
+                    women: originalWomen,
+                    assignedMen: 0,
+                    assignedWomen: 0,
+                    assignedMixed: 0,
+                });
+            }
+            const currentGuest = newGuestsMap.get(guestId);
+
+            if (tableGender === 'מעורב') {
+                detectedSeparateSeating = false; // If we see a mixed table, we are in mixed mode
+            }
+
+            if (tableName && tableId) { // Only process assigned guests
+                if (tableGender === 'גברים') {
+                    if (!importedMenTablesMap.has(tableId)) {
+                        importedMenTablesMap.set(tableId, { id: tableId, name: tableName, guests: [], capacity: defaultCapacity });
+                    }
+                    importedMenTablesMap.get(tableId).guests.push({ guestId: guestId, menCount: assignedMenToTable, womenCount: assignedWomenToTable });
+                    currentGuest.assignedMen += assignedMenToTable;
+                } else if (tableGender === 'נשים') {
+                    if (!importedWomenTablesMap.has(tableId)) {
+                        importedWomenTablesMap.set(tableId, { id: tableId, name: tableName, guests: [], capacity: defaultCapacity });
+                    }
+                    importedWomenTablesMap.get(tableId).guests.push({ guestId: guestId, menCount: assignedMenToTable, womenCount: assignedWomenToTable });
+                    currentGuest.assignedWomen += assignedWomenToTable;
+                } else if (tableGender === 'מעורב') {
+                    if (!importedMixedTablesMap.has(tableId)) {
+                        importedMixedTablesMap.set(tableId, { id: tableId, name: tableName, guests: [], capacity: defaultCapacity });
+                    }
+                    importedMixedTablesMap.get(tableId).guests.push({ guestId: guestId, menCount: assignedMenToTable, womenCount: assignedWomenToTable });
+                    currentGuest.assignedMixed += (assignedMenToTable + assignedWomenToTable);
+                }
+            }
+          });
+
+          setSeparateSeating(detectedSeparateSeating);
+          setGuests(Array.from(newGuestsMap.values()));
+
+          if (detectedSeparateSeating) {
+            setMenTables(Array.from(importedMenTablesMap.values()).length > 0 ? Array.from(importedMenTablesMap.values()) : [{ id: generateUniqueId('men'), name: 'גברים 1', guests: [], capacity: defaultCapacity }]);
+            setWomenTables(Array.from(importedWomenTablesMap.values()).length > 0 ? Array.from(importedWomenTablesMap.values()) : [{ id: generateUniqueId('women'), name: 'נשים 1', guests: [], capacity: defaultCapacity }]);
+            setMixedTables([]);
+          } else {
+            setMixedTables(Array.from(importedMixedTablesMap.values()).length > 0 ? Array.from(importedMixedTablesMap.values()) : [{ id: generateUniqueId('mix'), name: 'שולחן 1', guests: [], capacity: defaultCapacity }]);
+            setMenTables([]);
+            setWomenTables([]);
+          }
+
+        } catch (error) {
+          console.error("Import error:", error);
+          alert('שגיאה בייבוא הקובץ. ודא שהוא בפורמט הנכון מהייצוא של המערכת.');
+        }
+      };
+
+      // 9) Add New Guest manually
+      const handleAddGuest = () => {
+        if (!newGuestName.trim()) {
+          alert('אנא הזן שם מוזמן.');
+          return;
+        }
+        const newId = generateUniqueId('guest');
+        setGuests(prev => [...prev, {
+          id: newId,
+          name: newGuestName.trim(),
+          men: parseInt(newGuestMen) || 0,
+          women: parseInt(newGuestWomen) || 0,
+          assignedMen: 0,
+          assignedWomen: 0,
+          assignedMixed: 0,
+        }]);
+        setNewGuestName('');
+        setNewGuestMen(''); // Reset to empty string
+        setNewGuestWomen(''); // Reset to empty string
+        setShowAddGuestModal(false);
+      };
+
+      // 10) Export to PDF (image snapshot)
+      const exportToPdf = () => {
+        if (layoutRef.current) {
+          html2canvas(layoutRef.current, { scale: 2 }).then(canvas => {
+            const imgData = canvas.toDataURL('image/png');
+            const link = document.createElement('a');
+            link.download = 'shibutz_layout.png'; // Changed to PNG for direct image download
+            link.href = imgData;
+            document.body.appendChild(link);
+            link.click();
+            document.body.removeChild(link);
+            alert('הפריסה נשמרה כתמונה (PNG). ניתן להמיר אותה ל-PDF באמצעות כלים חיצוניים.');
+          });
+        }
+      };
+
+      // 11) Auto-Assign Guests
+      const autoAssignGuests = () => {
+        let tempMenTables = [...menTables.map(t => ({...t, guests: []}))]; // Clear existing assignments for auto-assign
+        let tempWomenTables = [...womenTables.map(t => ({...t, guests: []}))];
+        let tempMixedTables = [...mixedTables.map(t => ({...t, guests: []}))];
+        let tempGuests = guests.map(g => ({...g, assignedMen: 0, assignedWomen: 0, assignedMixed: 0})); // Reset assigned counts
+
+        const guestsToAssign = [...tempGuests].sort((a,b) => (b.men + b.women) - (a.men + a.women)); // Prioritize larger groups
+
+        guestsToAssign.forEach(guest => {
+            if (separateSeating) {
+                // Assign men
+                if (guest.men > 0) {
+                    let assignedMenCount = 0;
+                    for (let i = 0; i < tempMenTables.length; i++) {
+                        let table = tempMenTables[i];
+                        const currentOccupancy = calculateTableOccupancy(table, 'men');
+                        const freeSpace = table.capacity - currentOccupancy;
+                        if (freeSpace > 0) {
+                            const assignAmount = Math.min(guest.men, freeSpace); // Assign all men if space, else fill table
+                            if (assignAmount > 0) {
+                                table.guests.push({ guestId: guest.id, menCount: assignAmount, womenCount: 0 });
+                                assignedMenCount += assignAmount;
+                                break; // Move to next guest after assigning men to one table
+                            }
+                        }
+                    }
+                    guest.assignedMen = assignedMenCount;
+                }
+
+                // Assign women
+                if (guest.women > 0) {
+                    let assignedWomenCount = 0;
+                    for (let i = 0; i < tempWomenTables.length; i++) {
+                        let table = tempWomenTables[i];
+                        const currentOccupancy = calculateTableOccupancy(table, 'women');
+                        const freeSpace = table.capacity - currentOccupancy;
+                        if (freeSpace > 0) {
+                            const assignAmount = Math.min(guest.women, freeSpace);
+                            if (assignAmount > 0) {
+                                table.guests.push({ guestId: guest.id, menCount: 0, womenCount: assignAmount });
+                                assignedWomenCount += assignAmount;
+                                break; // Move to next guest after assigning women to one table
+                            }
+                        }
+                    }
+                    guest.assignedWomen = assignedWomenCount;
+                }
+            } else { // Mixed seating
+                const totalNeeded = guest.men + guest.women;
+                if (totalNeeded > 0) {
+                    let assignedMixedCount = 0;
+                    for (let i = 0; i < tempMixedTables.length; i++) {
+                        let table = tempMixedTables[i];
+                        const currentOccupancy = calculateTableOccupancy(table, 'mixed');
+                        const freeSpace = table.capacity - currentOccupancy;
+                        if (freeSpace > 0) {
+                            const assignAmount = Math.min(totalNeeded, freeSpace);
+                            if (assignAmount > 0) {
+                                // For mixed, we assign the full guest group if they fit
+                                table.guests.push({ guestId: guest.id, menCount: guest.men, womenCount: guest.women });
+                                assignedMixedCount += totalNeeded;
+                                break; // Move to next guest after assigning
+                            }
+                        }
+                    }
+                    guest.assignedMixed = assignedMixedCount;
+                }
+            }
+        });
+
+        // Update state with the results of auto-assignment
+        setMenTables(tempMenTables);
+        setWomenTables(tempWomenTables);
+        setMixedTables(tempMixedTables);
+        setGuests(tempGuests); // Update the main guest list with assigned counts
+        alert('השיבוץ האוטומטי הסתיים. בדוק את התוצאות.');
+      };
+
+
+      // Statistics calculations
+      const totalGuestsUploaded = guests.length;
+      const totalMen = guests.reduce((sum, g) => sum + g.men, 0);
+      const totalWomen = guests.reduce((sum, g) => sum + g.women, 0);
+      const totalPeople = totalMen + totalWomen;
+
+      const currentAssignedMen = menTables.reduce((sum, t) => sum + calculateTableOccupancy(t, 'men'), 0);
+      const currentAssignedWomen = womenTables.reduce((sum, t) => sum + calculateTableOccupancy(t, 'women'), 0);
+      const currentAssignedMixed = mixedTables.reduce((sum, t) => sum + calculateTableOccupancy(t, 'mixed'), 0);
+
+      const totalAssignedPeople = separateSeating ? (currentAssignedMen + currentAssignedWomen) : currentAssignedMixed;
+
+      const assignmentPercentage = totalPeople > 0 ? ((totalAssignedPeople / totalPeople) * 100).toFixed(1) : 0;
+
+      const unassignedFamiliesCount = getUnassignedGuestsList.length;
+      const unassignedMenCount = guests.reduce((sum, g) => sum + (g.men - g.assignedMen), 0);
+      const unassignedWomenCount = guests.reduce((sum, g) => sum + (g.women - g.assignedWomen), 0);
+      const unassignedMixedCount = guests.reduce((sum, g) => sum + ((g.men + g.women) - g.assignedMixed), 0);
+
+
+      const calculateAverageOccupancy = (tables, genderType) => {
+        if (tables.length === 0) return 0;
+        let totalCapacity = 0;
+        let totalOccupied = 0;
+        tables.forEach(t => {
+          totalCapacity += t.capacity;
+          totalOccupied += calculateTableOccupancy(t, genderType);
+        });
+        return totalCapacity > 0 ? ((totalOccupied / totalCapacity) * 100).toFixed(1) : 0;
+      };
+
+      const menTablesOccupancy = calculateAverageOccupancy(menTables, 'men');
+      const womenTablesOccupancy = calculateAverageOccupancy(womenTables, 'women');
+      const mixedTablesOccupancy = calculateAverageOccupancy(mixedTables, 'mixed');
+
+
+      // Components
+      const FamilyCard = ({ guest }) => {
+        const remainingMen = guest.men - guest.assignedMen;
+        const remainingWomen = guest.women - guest.assignedWomen;
+        const remainingMixed = (guest.men + guest.women) - guest.assignedMixed;
+
+        const isMenFullyAssigned = guest.men === 0 || remainingMen <= 0;
+        const isWomenFullyAssigned = guest.women === 0 || remainingWomen <= 0;
+        const isMixedFullyAssigned = (guest.men + guest.women) === 0 || remainingMixed <= 0;
+
+        const canDrag = separateSeating
+          ? (!isMenFullyAssigned || !isWomenFullyAssigned)
+          : !isMixedFullyAssigned;
+
+        return (
+          <div
+            draggable={canDrag}
+            onDragStart={e => canDrag && handleDragStart(e, guest)}
+            className={`p-2 mb-2 bg-white rounded-2xl shadow-md transition-all duration-200 border border-gray-100 ${
+              canDrag ? 'cursor-grab active:cursor-grabbing hover:shadow-lg' : 'opacity-70 cursor-not-allowed'
+            }`}
+          >
+            <div className="flex justify-between items-center">
+              <div>
+                <div className="font-medium text-gray-800">{guest.name}</div>
+                <div className="flex gap-2 text-sm">
+                  {guest.men > 0 && (
+                    <span
+                      className={`px-2 py-1 rounded-full text-sm font-semibold transition-colors duration-200 ${
+                        isMenFullyAssigned
+                          ? 'bg-gray-200 text-gray-500'
+                          : 'bg-blue-100 text-blue-800 hover:bg-blue-200 cursor-pointer'
+                      }`}
+                      onClick={() => !isMenFullyAssigned && openModal(guest, 'men')}
+                    >
+                      ♂ {remainingMen}
+                    </span>
+                  )}
+                  {guest.women > 0 && (
+                    <span
+                      className={`px-2 py-1 rounded-full text-sm font-semibold transition-colors duration-200 ${
+                        isWomenFullyAssigned
+                          ? 'bg-gray-200 text-gray-500'
+                          : 'bg-pink-100 text-pink-800 hover:bg-pink-200 cursor-pointer'
+                      }`}
+                      onClick={() => !isWomenFullyAssigned && openModal(guest, 'women')}
+                    >
+                      ♀ {remainingWomen}
+                    </span>
+                  )}
+                  {!separateSeating && (guest.men + guest.women) > 0 && (
+                     <span
+                     className={`px-2 py-1 rounded-full text-sm font-semibold transition-colors duration-200 ${
+                       isMixedFullyAssigned
+                         ? 'bg-gray-200 text-gray-500'
+                         : 'bg-green-100 text-green-800 hover:bg-green-200 cursor-pointer'
+                     }`}
+                     onClick={() => !isMixedFullyAssigned && openModal(guest, 'mixed')}
+                   >
+                     👥 {remainingMixed}
+                   </span>
+                  )}
+                </div>
+              </div>
+              <span className="text-gray-400 text-lg">⇅</span>
+            </div>
+          </div>
+        );
+      };
+
+      const Table = ({ table, genderType }) => {
+        const occupied = calculateTableOccupancy(table, genderType);
+        const isOver = dragOverTable === table.id;
+        const occupancyPercentage = (occupied / table.capacity) * 100;
+
+        const progressBarColor = occupancyPercentage < 70
+          ? 'bg-green-500'
+          : occupancyPercentage < 90
+            ? 'bg-orange-500'
+            : 'bg-red-500';
+
+        return (
+          <div className="bg-white rounded-2xl shadow-xl overflow-hidden border border-gray-100">
+            <div className="p-4 border-b flex flex-col">
+              <div className="flex justify-between items-center">
+                <div>
+                  <div className="font-bold text-xl text-gray-800">{table.name}</div>
+                  <div className="text-sm text-gray-600">{occupied}/{table.capacity} מקומות תפוסים</div>
+                </div>
+                <div className="flex gap-2 items-center">
+                  <input
+                    type="number" min="1"
+                    className="w-20 px-2 py-1 rounded-xl shadow-sm border border-gray-300 text-center text-sm"
+                    value={table.capacity}
+                    onChange={e => updateCapacity(table.id, parseInt(e.target.value) || 1, genderType)}
+                  />
+                  <button onClick={() => removeTable(table.id, genderType)} className="p-2 rounded-full hover:bg-red-100 text-red-600 transition-colors">
+                    <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" viewBox="0 0 20 20" fill="currentColor">
+                      <path fillRule="evenodd" d="M9 2a1 1 0 00-.894.553L7.382 4H4a1 1 0 000 2v10a2 2 0 002 2h8a2 2 0 002-2V6a1 1 0 100-2h-3.382l-.724-1.447A1 1 0 0011 2H9zM7 8a1 1 0 011-1h4a1 1 0 110 2H8a1 1 0 01-1-1zm2 3a1 1 0 011-1h2a1 1 0 110 2h-2a1 1 0 01-1-1z" clipRule="evenodd" />
+                    </svg>
+                  </button>
+                </div>
+              </div>
+              <div className="w-full bg-gray-200 rounded-full h-2.5 mt-3">
+                <div className={`h-2.5 rounded-full ${progressBarColor}`} style={{ width: `${occupancyPercentage}%` }}></div>
+              </div>
+            </div>
+            <div
+              onDragOver={e => handleDragOver(e, table.id)}
+              onDragLeave={handleDragLeave}
+              onDrop={e => handleDrop(e, table.id, genderType)}
+              className={`p-3 min-h-[120px] transition-colors duration-200 ${
+                isOver ? 'bg-indigo-50 border-2 border-dashed border-indigo-300' : 'bg-gray-50'
+              }`}
+            >
+              {table.guests.length > 0 ? table.guests.map(guestEntry => {
+                const g = guests.find(x => x.id === guestEntry.guestId);
+                if (!g) return null; // Ensure guest exists
+                return (
+                  <div key={g.id} className="relative group">
+                    <div className="p-2 mb-2 bg-white rounded-2xl shadow-sm border border-gray-100">
+                        <div className="font-medium text-gray-800">{g.name}</div>
+                        <div className="flex gap-2 text-sm text-gray-600">
+                            {genderType === 'men' && <span>♂ {guestEntry.menCount}</span>}
+                            {genderType === 'women' && <span>♀ {guestEntry.womenCount}</span>}
+                            {genderType === 'mixed' && <span>👥 {guestEntry.menCount + guestEntry.womenCount}</span>}
+                        </div>
+                    </div>
+                    <button
+                      onClick={() => unassign(g.id, table.id, genderType)}
+                      className="absolute top-1 right-1 p-1 text-red-500 bg-white rounded-full opacity-0 group-hover:opacity-100 transition-opacity duration-200 shadow-md hover:bg-red-50 hover:text-red-700"
+                    >
+                      <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2">
+                        <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
+                      </svg>
+                    </button>
+                  </div>
+                );
+              }) : (
+                <p className="text-center text-gray-400 text-sm py-4">גרור לכאן מוזמנים</p>
+              )}
+            </div>
+          </div>
+        );
+      };
+
+      const Modal = ({ isOpen }) => {
+        if (!isOpen || !selectedGuest) return null;
+
+        const needed = separateSeating
+            ? (modalGender === 'men' ? (selectedGuest.men - selectedGuest.assignedMen) : (selectedGuest.women - selectedGuest.assignedWomen))
+            : ((selectedGuest.men + selectedGuest.women) - selectedGuest.assignedMixed);
+
+        const tbls = getAvailableTablesForModal(modalGender);
+
+        return (
+          <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-4">
+            <div className="bg-white rounded-2xl p-6 max-w-sm w-full shadow-2xl">
+              <div className="flex justify-between items-center mb-4">
+                <h3 className="font-bold text-xl text-gray-800">שיבוץ {separateSeating
+                  ? (modalGender === 'men' ? 'גברים' : 'נשים')
+                  : 'מעורב'} – {selectedGuest.name}</h3>
+                <button onClick={closeModals} className="text-gray-500 hover:text-gray-800 p-1 rounded-full hover:bg-gray-100 transition-colors">
+                  <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2">
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
+                  </svg>
+                </button>
+              </div>
+              <p className="mb-4 text-gray-700">מקומות נדרשים: <span className="font-semibold">{needed}</span></p>
+              <div className="space-y-2 max-h-80 overflow-y-auto pb-2">
+                {tbls.length > 0 ? tbls.map(t => {
+                  const currentOccupancy = calculateTableOccupancy(t, modalGender);
+                  const free = t.capacity - currentOccupancy;
+                  const ok = free >= needed;
+                  return (
+                    <button
+                      key={t.id}
+                      disabled={!ok}
+                      onClick={() => ok && assignGuestToTable(selectedGuest, t.id, modalGender)}
+                      className={`w-full text-right p-3 rounded-xl transition-colors duration-200 flex justify-between items-center ${
+                        ok ? 'bg-green-50 hover:bg-green-100 text-green-800' : 'bg-red-50 text-red-500 opacity-60 cursor-not-allowed'
+                      }`}
+                    >
+                      <span className="font-medium">{t.name}</span>
+                      <span className="text-sm">פנוי {free}/{t.capacity}</span>
+                    </button>
+                  );
+                }) : (
+                  <div className="text-center text-gray-500 py-4">אין שולחנות פנויים כרגע עבור {modalGender === 'men' ? 'גברים' : modalGender === 'women' ? 'נשים' : 'מעורב'}</div>
+                )}
+              </div>
+            </div>
+          </div>
+        );
+      };
+
+      const AddGuestModal = ({ isOpen, onClose }) => {
+        if (!isOpen) return null;
+        return (
+          <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-4">
+            <div className="bg-white rounded-2xl p-6 max-w-sm w-full shadow-2xl">
+              <div className="flex justify-between items-center mb-4">
+                <h3 className="font-bold text-xl text-gray-800">הוסף מוזמן חדש</h3>
+                <button onClick={onClose} className="text-gray-500 hover:text-gray-800 p-1 rounded-full hover:bg-gray-100 transition-colors">
+                  <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2">
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
+                  </svg>
+                </button>
+              </div>
+              <div className="mb-4">
+                <label className="block text-gray-700 text-sm font-bold mb-2">שם המוזמן:</label>
+                <input
+                  type="text"
+                  value={newGuestName}
+                  onChange={e => setNewGuestName(e.target.value)}
+                  className="shadow appearance-none border rounded-xl w-full py-2 px-3 text-gray-700 leading-tight focus:outline-none focus:shadow-outline focus:border-blue-400"
+                  placeholder="שם המוזמן"
+                />
+              </div>
+              <div className="mb-4">
+                <label className="block text-gray-700 text-sm font-bold mb-2">מספר גברים:</label>
+                <input
+                  type="number"
+                  min="0"
+                  value={newGuestMen}
+                  onChange={e => {
+                    const value = e.target.value;
+                    setNewGuestMen(value);
+                  }}
+                  className="shadow appearance-none border rounded-xl w-full py-2 px-3 text-gray-700 leading-tight focus:outline-none focus:shadow-outline focus:border-blue-400"
+                />
+              </div>
+              <div className="mb-6">
+                <label className="block text-gray-700 text-sm font-bold mb-2">מספר נשים:</label>
+                <input
+                  type="number"
+                  min="0"
+                  value={newGuestWomen}
+                  onChange={e => {
+                    const value = e.target.value;
+                    setNewGuestWomen(value);
+                  }}
+                  className="shadow appearance-none border rounded-xl w-full py-2 px-3 text-gray-700 leading-tight focus:outline-none focus:shadow-outline focus:border-blue-400"
+                />
+              </div>
+              <div className="flex justify-end">
+                <button
+                  onClick={handleAddGuest}
+                  className="bg-blue-600 hover:bg-blue-700 text-white font-bold py-2 px-4 rounded-xl shadow-lg transition-colors"
+                >
+                  הוסף מוזמן
+                </button>
+              </div>
+            </div>
+          </div>
+        );
+      };
+
+      return (
+        <div className="max-w-7xl mx-auto">
+          {/* Header Buttons */}
+          <header className="text-center mb-8">
+            <h1 className="text-4xl font-extrabold text-gray-900 mb-5">מערכת שיבוץ שולחנות לאירוע</h1>
+            <div className="flex flex-wrap justify-center gap-4">
+              <input type="file" ref={fileInputRef} onChange={handleFileUpload} accept=".xlsx,.xls,.csv" className="hidden" />
+              <button
+                onClick={() => fileInputRef.current.click()}
+                className="bg-blue-600 hover:bg-blue-700 text-white px-5 py-2.5 rounded-full shadow-lg transition-all duration-300 transform hover:scale-105 flex items-center gap-2"
+              >
+                <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2">
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12" />
+                </svg>
+                העלה מוזמנים
+              </button>
+
+              <button
+                onClick={exportToExcel}
+                disabled={!guests.length}
+                className="bg-green-600 hover:bg-green-700 text-white px-5 py-2.5 rounded-full shadow-lg transition-all duration-300 transform hover:scale-105 flex items-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2">
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+                </svg>
+                ייצא Excel
+              </button>
+
+              <input type="file" ref={importRef} onChange={handleImport} accept=".xlsx" className="hidden" />
+              <button
+                onClick={() => importRef.current.click()}
+                className="bg-yellow-600 hover:bg-yellow-700 text-white px-5 py-2.5 rounded-full shadow-lg transition-all duration-300 transform hover:scale-105 flex items-center gap-2"
+              >
+                <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2">
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004 10.59V12m6 6l-3-3m0 0l-3 3m3-3v11.582m6.118-4H15a2.001 2.001 0 01-1.998-1.899l-1.498-8.502L12 9l-1-1-4 4" />
+                </svg>
+                ייבא שיבוץ
+              </button>
+
+              <button
+                onClick={() => setShowAddGuestModal(true)}
+                className="bg-purple-600 hover:bg-purple-700 text-white px-5 py-2.5 rounded-full shadow-lg transition-all duration-300 transform hover:scale-105 flex items-center gap-2"
+              >
+                <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2">
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v3m0 0v3m0-3h3m0 0h-3m-1-8a4 4 0 11-8 0 4 4 0 018 0zM12 14c-1.333 0-2.333-.667-3-2V8h6v4c-.667 1.333-1.667 2-3 2z" />
+                </svg>
+                הוסף מוזמן
+              </button>
+
+              <button
+                onClick={autoAssignGuests}
+                disabled={getUnassignedGuestsList.length === 0}
+                className="bg-cyan-600 hover:bg-cyan-700 text-white px-5 py-2.5 rounded-full shadow-lg transition-all duration-300 transform hover:scale-105 flex items-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2">
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M.03 20.315C-.067 18.91 1.603 17.653 3.003 17.558l3.65-.213.917-1.468c.553-.88 1.458-1.528 2.5-1.83l3.65-.213c1.4-.095 2.67.654 2.87 2.052l.917 1.468.917 1.468c.553.88 1.458 1.528 2.5 1.83l3.65.213c1.4.095 2.67-.654 2.87-2.052l-.917 1.468-.917-1.468c-.553-.88-1.458-1.528-2.5-1.83l-3.65-.213c-1.4-.095-2.67.654-2.87 2.052z" />
+                </svg>
+                שיבוץ אוטומטי
+              </button>
+
+              <button
+                onClick={exportToPdf}
+                className="bg-indigo-600 hover:bg-indigo-700 text-white px-5 py-2.5 rounded-full shadow-lg transition-all duration-300 transform hover:scale-105 flex items-center gap-2"
+              >
+                <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2">
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M4 16l4.586-4.586a2 2 0 012.828 0L15 15m0 0l3-3m0 0l3.586 3.586a2 2 0 010 2.828L18 20M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1" />
+                </svg>
+                ייצא תמונת פריסה (PNG)
+              </button>
+
+              <button
+                onClick={() => setShowSettings(true)}
+                className="bg-gray-600 hover:bg-gray-700 text-white px-5 py-2.5 rounded-full shadow-lg transition-all duration-300 transform hover:scale-105 flex items-center gap-2"
+              >
+                <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2">
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.298.07 2.572-1.065z" />
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
+                </svg>
+                הגדרות
+              </button>
+            </div>
+          </header>
+
+          {/* Main Layout */}
+          <div ref={layoutRef} className={`grid gap-8 p-6 bg-white rounded-3xl shadow-2xl ${
+            separateSeating ? 'grid-cols-1 lg:grid-cols-3' : 'grid-cols-1 lg:grid-cols-2'
+          }`}>
+            {/* Unassigned */}
+            <div className="bg-gray-50 rounded-2xl shadow-inner p-4 border border-gray-200">
+              <h2 className="font-bold text-2xl mb-4 text-gray-800 border-b pb-2">מוזמנים ללא שיבוץ ({getUnassignedGuestsList.length})</h2>
+              <div className="space-y-3 max-h-[500px] overflow-y-auto pr-2">
+                {getUnassignedGuestsList.length > 0 ? getUnassignedGuestsList.map(g => (
+                  <FamilyCard key={g.id} guest={g} />
+                )) : (
+                  <p className="text-center text-gray-400 py-6">כל המוזמנים שובצו!</p>
+                )}
+              </div>
+            </div>
+
+            {separateSeating ? (
+              <>
+                {/* Men Tables */}
+                <div>
+                  <div className="flex justify-between items-center mb-4 border-b pb-2">
+                    <h2 className="font-bold text-2xl text-blue-800">שולחנות גברים</h2>
+                    <button
+                      onClick={() => addTable('men')}
+                      className="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded-full shadow-md transition-all duration-300 transform hover:scale-105 flex items-center gap-1"
+                    >
+                      <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2">
+                        <path strokeLinecap="round" strokeLinejoin="round" d="M12 6v6m0 0v6m0-6h6m0 0h-6" />
+                      </svg>
+                      הוסף
+                    </button>
+                  </div>
+                  <div className="space-y-6">
+                    {menTables.map(t => <Table key={t.id} table={t} genderType="men" />)}
+                  </div>
+                </div>
+                {/* Women Tables */}
+                <div>
+                  <div className="flex justify-between items-center mb-4 border-b pb-2">
+                    <h2 className="font-bold text-2xl text-pink-800">שולחנות נשים</h2>
+                    <button
+                      onClick={() => addTable('women')}
+                      className="bg-pink-600 hover:bg-pink-700 text-white px-4 py-2 rounded-full shadow-md transition-all duration-300 transform hover:scale-105 flex items-center gap-1"
+                    >
+                      <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2">
+                        <path strokeLinecap="round" strokeLinejoin="round" d="M12 6v6m0 0v6m0-6h6m0 0h-6" />
+                      </svg>
+                      הוסף
+                    </button>
+                  </div>
+                  <div className="space-y-6">
+                    {womenTables.map(t => <Table key={t.id} table={t} genderType="women" />)}
+                  </div>
+                </div>
+              </>
+            ) : (
+              /* Mixed Tables */
+              <div className="lg:col-span-2">
+                <div className="flex justify-between items-center mb-4 border-b pb-2">
+                  <h2 className="font-bold text-2xl text-gray-800">שולחנות מעורבים</h2>
+                  <button
+                    onClick={() => addTable('mixed')}
+                    className="bg-gray-700 hover:bg-gray-800 text-white px-4 py-2 rounded-full shadow-md transition-all duration-300 transform hover:scale-105 flex items-center gap-1"
+                  >
+                    <svg xmlns="http://www.w3.org/2000/svg" className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2">
+                      <path strokeLinecap="round" strokeLinejoin="round" d="M12 6v6m0 0v6m0-6h6m0 0h-6" />
+                    </svg>
+                    הוסף
+                  </button>
+                </div>
+                <div className="space-y-6">
+                  {mixedTables.map(t => <Table key={t.id} table={t} genderType="mixed" />)}
+                </div>
+              </div>
+            )}
+          </div>
+
+          {/* Statistics Section */}
+          <div className="mt-8 bg-white rounded-3xl shadow-2xl p-6">
+            <h2 className="text-2xl font-bold text-gray-800 mb-4 border-b pb-3">סטטיסטיקות שיבוץ</h2>
+            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6 text-gray-700">
+              <div className="bg-blue-50 p-4 rounded-xl shadow-md">
+                <p className="font-semibold text-lg">סה"כ מוזמנים (קבוצות): {totalGuestsUploaded}</p>
+                <p>סה"כ גברים: {totalMen}</p>
+                <p>סה"כ נשים: {totalWomen}</p>
+              </div>
+              <div className="bg-red-50 p-4 rounded-xl shadow-md">
+                <p className="font-semibold text-lg">מוזמנים ללא שיבוץ (קבוצות): {unassignedFamiliesCount}</p>
+                {separateSeating ? (
+                  <>
+                    <p>גברים ללא שיבוץ: {unassignedMenCount}</p>
+                    <p>נשים ללא שיבוץ: {unassignedWomenCount}</p>
+                  </>
+                ) : (
+                    <p>מוזמנים מעורבים ללא שיבוץ: {unassignedMixedCount}</p>
+                )}
+              </div>
+              <div className="bg-green-50 p-4 rounded-xl shadow-md">
+                <p className="font-semibold text-lg">אחוז שיבוץ כולל: <span className="text-2xl font-extrabold">{assignmentPercentage}%</span></p>
+                {separateSeating ? (
+                  <>
+                    <p>תפוסת שולחנות גברים ממוצעת: {menTablesOccupancy}%</p>
+                    <p>תפוסת שולחנות נשים ממוצעת: {womenTablesOccupancy}%</p>
+                  </>
+                ) : (
+                  <p>תפוסת שולחנות מעורבים ממוצעת: {mixedTablesOccupancy}%</p>
+                )}
+              </div>
+            </div>
+          </div>
+
+          {/* Modals */}
+          <Modal isOpen={!!selectedGuest} />
+          <AddGuestModal isOpen={showAddGuestModal} onClose={() => setShowAddGuestModal(false)} />
+
+          {/* Settings */}
+          {showSettings && (
+            <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-4">
+              <div className="bg-white p-6 rounded-2xl max-w-md w-full shadow-2xl">
+                <div className="flex justify-between items-center mb-4">
+                  <h3 className="font-bold text-2xl text-gray-800">הגדרות</h3>
+                  <button onClick={() => setShowSettings(false)} className="text-gray-500 hover:text-gray-800 p-1 rounded-full hover:bg-gray-100 transition-colors">
+                    <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth="2">
+                      <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
+                    </svg>
+                  </button>
+                </div>
+                <div className="flex items-center gap-3 mb-5 p-3 bg-gray-50 rounded-xl border border-gray-200">
+                  <input
+                    type="checkbox"
+                    id="separateSeatingToggle"
+                    checked={separateSeating}
+                    onChange={toggleSeatingMode}
+                    className="h-5 w-5 text-blue-600 rounded focus:ring-blue-500"
+                  />
+                  <label htmlFor="separateSeatingToggle" className="text-gray-700 font-medium cursor-pointer">ישיבה נפרדת (גברים/נשים)</label>
+                </div>
+                <div className="flex items-center gap-3 mb-6 p-3 bg-gray-50 rounded-xl border border-gray-200">
+                  <label htmlFor="defaultCapacityInput" className="text-gray-700 font-medium">קיבולת שולחן ברירת מחדל:</label>
+                  <input
+                    type="number"
+                    id="defaultCapacityInput"
+                    min="1"
+                    value={defaultCapacity}
+                    onChange={e => setDefaultCapacity(parseInt(e.target.value) || 1)}
+                    className="w-24 border border-gray-300 px-3 py-1.5 rounded-xl shadow-sm text-center text-gray-700 focus:outline-none focus:border-blue-400"
+                  />
+                </div>
+                <div className="flex justify-end">
+                  <button
+                    onClick={() => setShowSettings(false)}
+                    className="bg-blue-600 hover:bg-blue-700 text-white font-bold py-2.5 px-6 rounded-full shadow-lg transition-all duration-300 transform hover:scale-105"
+                  >
+                    סגור
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root'))
+      .render(<TableSeatingSystem />);
+  </script>
+</body>
+</html>
